@@ -1,6 +1,6 @@
 # Three-Agent Message Bus Architecture
 
-**Status:** Design proposal. Not implemented. Captures the shape arrived at during exploratory iteration on branch `claude/three-agent-message-bus-Y4ebq`.
+**Status:** Substrate (plan, bus, amendment protocol, supervisor) implemented as a Python prototype in `three_agent_bus/`, driven by scenarios in `three_agent_bus/drivers/scenarios.py`. The LLM executor and adversary are not built — per the design's own build order, the substrate must survive stupid drivers first.
 
 ## Premise
 
