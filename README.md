@@ -41,9 +41,13 @@ Requires Python 3.10+. The only runtime dependency is Pydantic.
 ## Run the example
 
 ```bash
-python -m examples.echo_session     # all three primitives, smallest possible
-python -m examples.extract_session  # Pattern 1 — pure tool pipeline
-python -m examples.bugfix_session   # Pattern 3 — sub-agent + grounded test verifier
+python -m examples.echo_session            # all three primitives, smallest possible
+python -m examples.extract_session         # Pattern 1 — pure tool pipeline
+python -m examples.sql_session             # Pattern 2 — tools + grounded verifier
+python -m examples.bugfix_session          # Pattern 3 — sub-agent + grounded test verifier
+python -m examples.codebase_walk_session   # Pattern 4 — depth-2 recursive search
+python -m examples.multi_verify_session    # Pattern 5 — multi-verifier AND-gate
+python -m examples.resumable_session       # Pattern 6 — resumable long-run
 ```
 
 Each example writes a session directory under `.sessions/` containing

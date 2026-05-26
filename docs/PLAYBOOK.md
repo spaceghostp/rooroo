@@ -62,6 +62,8 @@ class FetchUserTool(Tool):
 had its own working memory, you've outgrown this pattern — promote one
 piece of the work to a sub-agent.
 
+**Runnable example:** `examples/extract_session.py`
+
 **Anti-patterns to watch:**
 - Sneaking an LLM call into `_execute`. Tools are deterministic by
   definition (§4.1); if you need a model call, that's a sub-agent.
@@ -123,6 +125,10 @@ class SQLDryRunVerifier(Verifier):
 a verdict; the *planner* sees the verdict on the next iteration and
 either re-emits a fixed `ToolAction` or finishes. Cap retries at
 `Verifier.max_retries`. No unbounded refine loops (§4.3).
+
+**Runnable example:** `examples/sql_session.py` — `compose_query` tool
+plus a `sql_explain` verifier that touches schema + row-count evidence
+and walks the planner from a column-not-found failure to a clean pass.
 
 **Anti-patterns to watch:**
 - A "verifier" that just asks an LLM "does this look right?" — that's
@@ -186,7 +192,9 @@ class LocateBugAgent(SubAgent):
         ...
 ```
 
-See `examples/bugfix_session.py` for a runnable end-to-end version.
+**Runnable example:** `examples/bugfix_session.py` — read-only sub-agent
+locates the bug, parent applies the fix via a write tool, grounded
+verifier executes the test code via `sys.modules` injection.
 
 **Anti-patterns to watch:**
 - The sub-agent is just a wrapper around one LLM call with no
@@ -255,6 +263,12 @@ class WalkDirAgent(SubAgent):
   the principle in §2, and what's the cost?" — *not* an
   implementation tweak.
 
+**Runnable example:** `examples/codebase_walk_session.py` — top
+coordinator dispatches `walk_dir` (depth=1), which runs its own inner
+coordinator that invokes `extract_symbols` (depth=2, with
+justification). The example ends by showing what happens when an
+unjustified sub-agent is invoked at depth=2 (`DepthLimitExceeded`).
+
 ---
 
 ## Pattern 5 — Multi-Verifier Gate (use with care)
@@ -296,6 +310,12 @@ return Plan(terminate=True, next_action=FinishAction(result={...}))
 - A "rollup verifier" that runs the other verifiers internally and
   composes their results. The trace becomes opaque. Keep each verifier
   as its own step so the trace shows which check failed.
+
+**Runnable example:** `examples/multi_verify_session.py` — generates
+`double(x)` and gates it through syntax + types + unit tests. Uses a
+small custom `GatePlanner` so the AND-composition logic is visible (it
+walks the verifier list, retries the generator with the next version
+on any failure, finishes when all three pass in a row).
 
 ---
 
@@ -343,6 +363,11 @@ if result.incomplete:
   resumable parent does not automatically resume a sub-agent's
   in-flight loop. Sub-agents should be small enough to complete within
   one parent iteration.
+
+**Runnable example:** `examples/resumable_session.py` — two coordinator
+runs against the same `session_dir`. Run 1 has an undersized iteration
+budget and exits with `incomplete=True` after 3 items. Run 2 picks up
+the remaining 7 from `FileSystemState` and completes.
 
 ---
 
