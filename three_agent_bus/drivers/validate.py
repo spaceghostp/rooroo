@@ -76,6 +76,12 @@ def _evaluate(label: str, expected: str, runner: Runner, result: RunResult) -> V
                 for o in objections
             )
         )
+    elif expected == "llm_clean_run":
+        passed = (
+            result.terminated == "done"
+            and not any(f.kind in ("stuck", "budget_exceeded") for f in result.findings)
+            and len(unresolved) == 0
+        )
     return Verdict(label=label, expected=expected, passed=passed, notes=notes)
 
 
@@ -364,6 +370,102 @@ def adversary_halts() -> Verdict:
     return verdict
 
 
+def claude_code_e2e_clean() -> Optional[Verdict]:
+    """Both agents LLM-driven via Claude Code. Tests that a competent executor
+    completes the task and the adversary correctly stays silent (no nitpicking).
+    """
+    import shutil
+
+    if shutil.which("claude") is None:
+        print(f"\n=== claude_code_e2e_clean (SKIPPED) ===")
+        print("  `claude` CLI not on PATH.")
+        return None
+
+    from ..llm import ClaudeCodeLLM
+
+    plan, bus, sup = _new_validate_username_setup("claude_code_e2e_clean")
+
+    executor_llm = ClaudeCodeLLM(model="sonnet")
+    adversary_llm = ClaudeCodeLLM(model="sonnet")
+
+    runner = Runner(
+        plan, bus, sup,
+        executor=LLMAgent(executor_llm, role="executor"),
+        adversary=LLMAgent(adversary_llm, role="adversary"),
+        task_brief=VALIDATE_USERNAME_BRIEF,
+        max_ticks=5,
+    )
+
+    print(f"\n=== claude_code_e2e_clean ===")
+    print("  (each tick spawns 2 `claude -p` subprocesses; this is slow)")
+    result = runner.run()
+    _print_transcript(runner)
+    verdict = _evaluate(
+        "claude_code_e2e_clean", "llm_clean_run", runner, result
+    )
+    _print_verdict(verdict)
+    return verdict
+
+
+def claude_code_catches_flaw() -> Optional[Verdict]:
+    """Scripted executor posts a clearly-incomplete implementation. The Claude
+    Code adversary must catch it citing a real constraint. Isolates the
+    adversary's detection ability (executor behavior is held constant).
+    """
+    import shutil
+
+    if shutil.which("claude") is None:
+        print(f"\n=== claude_code_catches_flaw (SKIPPED) ===")
+        print("  `claude` CLI not on PATH.")
+        return None
+
+    from ..llm import ClaudeCodeLLM
+
+    plan, bus, sup = _new_validate_username_setup("claude_code_catches_flaw")
+
+    def flawed_executor(s: AgentState) -> list[Action]:
+        if s.tick == 1:
+            return [
+                Action(
+                    "observation",
+                    {
+                        "topic": "src/util.py",
+                        "content": (
+                            "wrote validate_username in src/util.py. "
+                            "Implementation: `def validate_username(s): return s.lower()`. "
+                            "Single line, just lowercases the input."
+                        ),
+                        "artifact_change": True,
+                    },
+                )
+            ]
+        # If the adversary did its job, we honor it; otherwise try to declare done
+        if s.tick == 2:
+            return [Action("silent", {})]
+        return [Action("done", {})]
+
+    adversary_llm = ClaudeCodeLLM(model="sonnet")
+
+    runner = Runner(
+        plan, bus, sup,
+        executor=ScriptedAgent(flawed_executor),
+        adversary=LLMAgent(adversary_llm, role="adversary"),
+        task_brief=VALIDATE_USERNAME_BRIEF,
+        max_ticks=4,
+    )
+
+    print(f"\n=== claude_code_catches_flaw ===")
+    print("  (scripted executor announces a deliberately incomplete impl;")
+    print("   Claude Code adversary should object citing C-1 and/or C-2)")
+    result = runner.run()
+    _print_transcript(runner)
+    verdict = _evaluate(
+        "claude_code_catches_flaw", "llm_caught_and_resolved", runner, result
+    )
+    _print_verdict(verdict)
+    return verdict
+
+
 def llm_adversarial() -> Optional[Verdict]:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(f"\n=== llm_adversarial (SKIPPED) ===")
@@ -398,6 +500,8 @@ SCENARIOS: dict[str, Callable[[], Optional[Verdict]]] = {
     "adversary_blocks_premature_done": adversary_blocks_premature_done,
     "adversary_pingpong_caught": adversary_pingpong_caught,
     "adversary_halts": adversary_halts,
+    "claude_code_e2e_clean": claude_code_e2e_clean,
+    "claude_code_catches_flaw": claude_code_catches_flaw,
     "llm_adversarial": llm_adversarial,
 }
 
