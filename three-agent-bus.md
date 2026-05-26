@@ -1,6 +1,6 @@
 # Three-Agent Message Bus Architecture
 
-**Status:** Substrate (plan, bus, amendment protocol, supervisor) implemented as a Python prototype in `three_agent_bus/`, driven by scenarios in `three_agent_bus/drivers/scenarios.py`. The LLM executor and adversary are not built — per the design's own build order, the substrate must survive stupid drivers first.
+**Status:** Full prototype in `three_agent_bus/` — substrate (plan, bus, amendment protocol, supervisor), agent layer (`LLMAgent` + `ScriptedAgent`), runner, two LLM adapters (`AnthropicLLM` direct-API, `ClaudeCodeLLM` subprocess via `claude -p`), and a 9-scenario adversarial validation harness. Real adversarial catches confirmed end-to-end with both Sonnet and Opus via Claude Code. See *Lessons from Implementation* below for honest read on what's earned vs unearned.
 
 ## Premise
 
@@ -108,6 +108,30 @@ Once typed constraints + versioned amendments + ratification are in place, the s
 Most of the design problems (conflict resolution, history, blame, rollback) are already solved in version control and consensus literature; this design just puts two LLMs on top of that substrate.
 
 The recommended build order is therefore *inverted*: build the rule base, amendment protocol, and supervisor first, with dumb scripts driving them. Add the executor and adversary only once the substrate survives being driven by stupid drivers. If the substrate cannot survive scripts, two LLMs will not save it — they will hide the failures.
+
+## Lessons from Implementation
+
+The substrate, agent layer, two LLM adapters (`AnthropicLLM` direct-API and `ClaudeCodeLLM` subprocess), and an adversarial validation harness have been built and exercised. What survived contact with code:
+
+**Vindicated.** The plan-as-typed-rule-base, versioned amendments, and control-plane-not-deliberator moves are the durable content. The supervisor is ~150 lines of pure functions; every mechanical rule (stale citation, stuck/ping-pong, drift, budget, override excess, unanswered objection, amendment storm) wrote itself once the message contract was fixed. The protocol carries catches end-to-end: in the `claude_code_subtle_flaw_*` scenarios, the adversary's grounded objection propagates through the supervisor and the runner refuses to let the executor finalize `done`, exactly as designed.
+
+**Rhetorical, not delivered.** The "live async adversary monitoring a continuously-running executor" framing is undelivered by the implementation, which is tick-driven alternation — a synchronous executor/critic loop in slow motion. Making it actually async (concurrent agent loops, real bus semantics with timing, an adversary that wakes on artifact-change events and runs against a moving target) is a separate engineering project. The current build is a critic-after-each-step pattern dressed in async vocabulary.
+
+**Discovered (negative result worth keeping).** The biggest architectural smell I called out — executor and adversary on the same model share blind spots — does not manifest at the complexity tested. On the `replace_instead_of_reject` subtle flaw (description claims constraint compliance, code sanitizes instead of rejects), Sonnet and Opus both caught the violation with substantively equivalent rationales (cite C-1, articulate "strip ≠ reject," give a concrete attack input). Heterogeneous-model configurations (`subtle_flaw_heterogeneous` opus-adversary vs `subtle_flaw_sonnet` sonnet-adversary) offered no measurable advantage at this scenario complexity. That doesn't disprove the smell — at *higher* flaw subtlety (race conditions, security boundaries, off-by-one) the answer might differ — but at this level the structured back-and-forth catches nothing a single careful reviewer-prompted LLM call wouldn't catch.
+
+**Operating regime, honest.** The whole system operates on *prose announcements* of code, not actual code. The executor says "I wrote X" and the adversary reads the description. That's a semantic illusion at the heart of the validation: we're testing whether agents can play role-aligned text games against constraints, not whether they can review real diffs. Pursuing real code as artifact (the executor actually writes to files; the adversary actually reads them via tools) is the load-bearing next step if this is to be more than an experiment.
+
+**What's earned vs unearned.** The architecture earned one star — the protocol works, the catches propagate, the gate holds. It has not earned the multi-star claim that this design catches things a competent single-pass critic would miss. That question requires: real code (not announcements), genuinely subtle flaws (security boundaries, concurrency, off-by-one — not "missing function body"), many trials per scenario, and a control comparison against a single-pass critic on the same artifacts. Without that, "the adversary caught the flaw" is informative but not conclusive — a single Sonnet call prompted "find bugs in this code, cite plan constraints" would have caught the same things.
+
+**Both LLM paths remain wired.** `ClaudeCodeLLM` (subprocess via `claude -p`, uses local Claude Code auth, no API key required) and `AnthropicLLM` (direct SDK calls with adaptive thinking + prompt caching, requires `ANTHROPIC_API_KEY`) are both first-class and independently exported. Agents can be mixed: e.g., `LLMAgent(ClaudeCodeLLM(model="sonnet"), role="executor")` paired with `LLMAgent(AnthropicLLM(model="claude-opus-4-7"), role="adversary")`. This optionality is the only thing that lets the heterogeneous-models hypothesis be tested cheaply against subscription-billed and API-billed providers in the same run.
+
+**Forks from here.** Three honest paths:
+
+1. *Extract and stop.* Treat the typed-rule-base + control-plane reframe as the deliverable. The implementation is sufficient as a reference for someone evaluating the design; further building doesn't sharpen the intellectual content.
+2. *Force the question on a real use case.* Wire this into rooroo as the planner/critic loop on actual PRs. Pick a narrow domain (e.g., security-sensitive Python). Pair Sonnet-executor with Opus-adversary or vice versa. Run on 20+ real diffs. Compare catch rate against a single Opus call with a strong reviewer prompt. *This is the only experiment that answers whether the architecture earns its complexity.*
+3. *Park.* The intellectual content is captured here; the substrate is small enough that revisiting it is cheap; come back if a use case forces the question.
+
+(1) is the highest-EV move given how the validation went. (2) is a research project, not a feature, and should only be taken on with a specific reason to believe it'd be worth the cost.
 
 ## Smell-checks / Unresolved
 
