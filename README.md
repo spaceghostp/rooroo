@@ -26,6 +26,10 @@ against.
 See `docs/SPEC.md` §2 for the seven locked principles (P1–P7) and §10 for
 the acceptance criteria the implementation must satisfy.
 
+For copy-pasteable configurations — pure-tool pipelines, tools+verifier,
+the canonical depth-1 stack, depth-2 recursive search, multi-verifier
+gating, resumable long-runs — see [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md).
+
 ## Install
 
 ```bash
@@ -37,13 +41,14 @@ Requires Python 3.10+. The only runtime dependency is Pydantic.
 ## Run the example
 
 ```bash
-python -m examples.echo_session
+python -m examples.echo_session     # all three primitives, smallest possible
+python -m examples.extract_session  # Pattern 1 — pure tool pipeline
+python -m examples.bugfix_session   # Pattern 3 — sub-agent + grounded test verifier
 ```
 
-This wires up one tool (`add`), one sub-agent (`classify`), and one
-verifier (`schema_check`), then runs a session with a scripted planner.
-You'll see the structured result, a trace path under `.sessions/echo/`,
-and a state directory you can inspect.
+Each example writes a session directory under `.sessions/` containing
+the JSONL trace and the typed state — both are meant to be inspected
+after the run.
 
 ## Run the tests
 
