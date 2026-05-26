@@ -13,6 +13,14 @@ The scripted planner walks through:
 
 This is the same shape a real LLM-backed coordinator would produce — just
 with the actions hand-rolled so the example has no API dependency.
+
+Note on the sub-agent: ``ClassifySubAgent`` is a deliberately trivial
+``_run`` (a static if/elif over an int) so this example can stay the
+smallest possible primitives-coverage demo. The SPEC §4.2 "When NOT to
+use a sub-agent" test would correctly say "this should be a tool" if
+the rest of the system were real. For the canonical depth-1 sub-agent
+shape — inner coordinator, allowlist-filtered registry, carved
+budget — see ``examples/bugfix_session.py``.
 """
 
 from __future__ import annotations

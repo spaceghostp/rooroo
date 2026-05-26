@@ -9,6 +9,15 @@ chain:
     └─ WalkDirAgent (depth=1)            -- runs its OWN inner Coordinator
          └─ ExtractSymbolsAgent (depth=2) -- has depth2_justification (P3)
 
+Every tool call — including the BFS over directories — happens *inside*
+the inner Coordinator's loop, so P7 (every step is observable) holds
+all the way down. The inner Registry is built from the parent's
+registry via ``self.build_inner_registry(...)``, so ``tool_allowlist``
+is enforced live: an unknown allowlist entry raises
+``AllowlistViolation`` before the inner loop starts. The inner Budget
+is carved from the parent's (P6, §7) so token / wall-time consumption
+propagates back up.
+
 If ``ExtractSymbolsAgent.depth2_justification`` were empty, the inner
 coordinator's call into ``extract_symbols.run(depth=2)`` would raise
 ``DepthLimitExceeded``. We demonstrate that refusal at the bottom of
@@ -33,6 +42,9 @@ from harness import (
     Coordinator,
     DepthLimitExceeded,
     FinishAction,
+    Plan,
+    PlanRequest,
+    Planner,
     Registry,
     ScriptedPlanner,
     SubAgent,
@@ -175,12 +187,83 @@ class WalkResult(SubAgentResult):
     by_file: dict[str, list[str]]
 
 
+class _WalkPlanner(Planner):
+    """Plan→observe BFS over the fake repo, all inside the inner
+    Coordinator so every step lands in the trace (P7).
+
+    Phase A: drain a stack of directories via ``list_dir`` actions,
+    collecting .py file paths into ``_py_files``.
+    Phase B: dispatch ``extract_symbols`` once per .py file (these are
+    the depth-2 sub-agent invocations).
+    Phase C: finish, returning the gathered symbol map.
+    """
+
+    def __init__(self, root: str) -> None:
+        self._stack: list[str] = [root]
+        self._py_files: list[str] = []
+        self._extract_cursor = 0
+        self._symbols: dict[str, list[str]] = {}
+        self._current_dir: str | None = None
+        self._current_file: str | None = None
+        self._phase = "list"  # list | extract
+
+    def plan(self, request: PlanRequest) -> Plan:
+        obs = request.last_observation or {}
+        out = obs.get("output") if obs else None
+
+        # --- Phase A: BFS via list_dir ---------------------------------
+        if self._phase == "list":
+            # Process a list_dir result, if any.
+            if out and "entries" in out and self._current_dir is not None:
+                for name in out["entries"]:
+                    child = f"{self._current_dir.rstrip('/')}/{name}" if self._current_dir else name
+                    if name.endswith("/"):
+                        self._stack.append(child.rstrip("/"))
+                    elif name.endswith(".py"):
+                        self._py_files.append(child)
+                self._current_dir = None
+            if self._stack:
+                self._current_dir = self._stack.pop()
+                return Plan(
+                    next_action=ToolAction(
+                        tool="list_dir",
+                        arguments={"path": self._current_dir},
+                        rationale=f"BFS into {self._current_dir}",
+                    )
+                )
+            # Stack drained; pivot to extraction phase.
+            self._phase = "extract"
+
+        # --- Phase B: extract_symbols per .py file ---------------------
+        if obs and self._phase == "extract":
+            sa_out = obs.get("output") if obs else None
+            if sa_out and "file_path" in sa_out and "symbols" in sa_out:
+                self._symbols[sa_out["file_path"]] = sa_out["symbols"]
+
+        if self._extract_cursor < len(self._py_files):
+            file_path = self._py_files[self._extract_cursor]
+            self._extract_cursor += 1
+            return Plan(
+                next_action=SubAgentAction(
+                    subagent="extract_symbols",
+                    task={"file_path": file_path},
+                    rationale=f"extract from {file_path} (depth-2)",
+                )
+            )
+
+        # --- Phase C: finish -------------------------------------------
+        return Plan(
+            terminate=True,
+            next_action=FinishAction(result={"by_file": self._symbols}),
+        )
+
+
 class WalkDirAgent(SubAgent):
     """Recursively walks ``root`` and, for each .py file found, dispatches
-    to ``extract_symbols``. Runs its own inner Coordinator at ``depth=1``
-    so the inner coordinator's calls into ``extract_symbols`` resolve at
-    ``depth=2`` — which is exactly when ``depth2_justification`` is
-    consulted by the harness.
+    to ``extract_symbols``. The walk and the extraction both run inside
+    the same inner Coordinator at ``depth=1`` so the inner coordinator's
+    calls into ``extract_symbols`` resolve at ``depth=2`` — exactly when
+    ``depth2_justification`` is consulted by the harness.
     """
 
     name = "walk_dir"
@@ -190,65 +273,26 @@ class WalkDirAgent(SubAgent):
     tool_allowlist = ("list_dir", "read_file")
 
     def _run(self, task: WalkTask, scratch: dict) -> WalkResult:
-        # Build the inner registry — tools subset + the one depth-2 sub-agent.
-        inner_registry = Registry()
-        inner_registry.register_tool(ListDirTool())
-        inner_registry.register_tool(ReadFileTool())
+        # Inner registry: tool subset enforced by allowlist (§4.2), plus
+        # the one depth-2 sub-agent this walker drives.
+        inner_registry = self.build_inner_registry(scratch["parent_registry"])
         inner_registry.register_subagent(ExtractSymbolsAgent())
 
-        # Walk the tree breadth-first, gathering .py files. We do this with
-        # real tool calls inside the inner coordinator so the harness sees
-        # the work and the depth chain stays honest.
-        py_files: list[str] = []
-
-        def _collect(path: str) -> list[str]:
-            tool = inner_registry.tools["list_dir"]
-            res = tool.call({"path": path})
-            if not res.ok:
-                return []
-            return res.output["entries"]
-
-        stack = [task.root]
-        while stack:
-            here = stack.pop()
-            for name in _collect(here):
-                child = f"{here.rstrip('/')}/{name}" if here else name
-                if name.endswith("/"):
-                    stack.append(child.rstrip("/"))
-                elif name.endswith(".py"):
-                    py_files.append(child)
-
-        # Now dispatch extract_symbols once per file via the inner
-        # coordinator. depth=1 here means the inner coord will invoke
-        # sub-agents at depth=2.
-        actions: list = []
-        for fp in py_files:
-            actions.append(
-                SubAgentAction(
-                    subagent="extract_symbols",
-                    task={"file_path": fp},
-                    rationale=f"extract from {fp}",
-                )
-            )
-        actions.append(FinishAction(result={"files": py_files}))
+        # Carve a sub-budget from the parent so token/wall-time consumption
+        # propagates back (P6). Iterations are local.
+        inner_budget = self.carve_budget(
+            scratch["parent_budget"],
+            max_iterations=40,
+        )
 
         inner = Coordinator(
-            planner=ScriptedPlanner(actions=actions, finish_result={"files": py_files}),
+            planner=_WalkPlanner(task.root),
             registry=inner_registry,
-            budget=Budget(max_iterations=2 * len(py_files) + 4, max_tokens=50_000),
-            depth=1,  # critical: makes inner sub-agent invocations land at depth=2
+            budget=inner_budget,
+            depth=scratch["depth"],  # =1 ⇒ inner sub-agent calls land at depth=2
         )
-        inner.run(f"Symbol-walk under {task.root}")
-
-        # Pull the typed sub-agent outputs back out of the inner trace.
-        from harness.types import ActionType
-
-        by_file: dict[str, list[str]] = {}
-        for entry in inner.trace.by_type(ActionType.SUBAGENT):
-            out = entry.action_output.get("output") or {}
-            if "file_path" in out and "symbols" in out:
-                by_file[out["file_path"]] = out["symbols"]
-
+        inner_result = inner.run(f"Symbol-walk under {task.root}")
+        by_file = inner_result.result.get("by_file", {})
         return WalkResult(by_file=by_file)
 
 

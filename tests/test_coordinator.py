@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import BaseModel
 
 from harness import (
     Budget,
@@ -12,6 +13,8 @@ from harness import (
     ScriptedPlanner,
     SubAgentAction,
     ToolAction,
+    Verdict,
+    Verifier,
     VerifyAction,
 )
 from harness.errors import UnknownPrimitive
@@ -140,3 +143,113 @@ def test_planner_does_not_see_full_trace():
     assert "trace" not in fields
     assert "trace_entries" not in fields
     assert "transcript" not in fields
+
+
+# ----- §4.3: verifier max_retries is enforced by the coordinator --------
+
+
+class _AlwaysFailsTarget(BaseModel):
+    note: str = ""
+
+
+class _AlwaysFailsVerifier(Verifier):
+    """Returns a grounded failed verdict every time. Used to prove the
+    coordinator caps the loop at ``max_retries`` failures (§4.3)."""
+
+    name = "always_fails"
+    description = "Always returns passed=False, with evidence."
+    target_schema = _AlwaysFailsTarget
+    evidence_sources = ("schema_validate",)
+    max_retries = 2  # so the third failure trips the cap
+
+    def _verify(self, target):
+        return Verdict(
+            passed=False,
+            evidence=["schema_validate: synthetic failure"],
+            suggested_revisions=["impossible to satisfy"],
+        )
+
+
+def test_coordinator_caps_verifier_retries():
+    """After ``max_retries`` failed verdicts on the same verifier, the
+    coordinator terminates with ``incomplete=True`` regardless of what
+    the planner emits next.
+
+    With ``max_retries=2``, the third verify call exhausts the budget
+    and the loop ends.
+    """
+    registry = Registry()
+    registry.register_verifier(_AlwaysFailsVerifier())
+
+    # Planner emits four verify actions; the coordinator should cut us
+    # off after the third fail (i.e. the third dispatched verify).
+    actions = [
+        VerifyAction(verifier="always_fails", target={"note": "try 1"}),
+        VerifyAction(verifier="always_fails", target={"note": "try 2"}),
+        VerifyAction(verifier="always_fails", target={"note": "try 3"}),
+        VerifyAction(verifier="always_fails", target={"note": "try 4"}),
+        FinishAction(result={"unreachable": True}),
+    ]
+    coord = Coordinator(
+        planner=ScriptedPlanner(actions=actions, finish_result={"unreachable": True}),
+        registry=registry,
+        budget=Budget(max_iterations=20, max_tokens=10_000, max_wall_seconds=10),
+    )
+    res = coord.run("retry-cap test")
+
+    assert res.incomplete is True
+    assert (res.incomplete_reason or "").startswith("retry_budget_exhausted:")
+    assert "always_fails" in (res.incomplete_reason or "")
+    # Exactly three verify dispatches landed on the trace.
+    from harness.types import ActionType
+    assert len(coord.trace.by_type(ActionType.VERIFY)) == 3
+
+
+def test_coordinator_retry_counter_only_counts_failures():
+    """A passing verdict does not consume the retry budget."""
+
+    class _AlternateTarget(BaseModel):
+        attempt: int
+
+    class _AlternatesVerifier(Verifier):
+        """Fails on even-numbered attempts, passes on odd ones."""
+
+        name = "alternates"
+        description = "Pass/fail based on attempt index."
+        target_schema = _AlternateTarget
+        evidence_sources = ("schema_validate",)
+        max_retries = 1  # only one failure permitted
+
+        def _verify(self, target):
+            if target.attempt % 2 == 0:
+                return Verdict(
+                    passed=False,
+                    evidence=[f"schema_validate: attempt {target.attempt} fails"],
+                )
+            return Verdict(
+                passed=True,
+                evidence=[f"schema_validate: attempt {target.attempt} passes"],
+            )
+
+    registry = Registry()
+    registry.register_verifier(_AlternatesVerifier())
+
+    # fail(0) -> pass(1) -> fail(2). Only two failures total, but they
+    # are interleaved with a success. The counter does not reset on
+    # success — both failures count toward max_retries=1, so the second
+    # failure ends the session.
+    actions = [
+        VerifyAction(verifier="alternates", target={"attempt": 0}),
+        VerifyAction(verifier="alternates", target={"attempt": 1}),
+        VerifyAction(verifier="alternates", target={"attempt": 2}),
+        VerifyAction(verifier="alternates", target={"attempt": 3}),
+        FinishAction(result={}),
+    ]
+    coord = Coordinator(
+        planner=ScriptedPlanner(actions=actions),
+        registry=registry,
+    )
+    res = coord.run("interleaved-retry test")
+
+    assert res.incomplete is True
+    assert "retry_budget_exhausted:alternates" in (res.incomplete_reason or "")

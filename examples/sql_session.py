@@ -11,9 +11,11 @@ The verifier is grounded in two evidence sources:
   - ``query_db``: the (mock) planner can EXPLAIN the SQL and reports a
     plausible row estimate
 
-A real planner would retry the tool on a failed verdict (up to
-``Verifier.max_retries``); we script a happy-path + a deliberately-bad
-path so the trace shows both branches.
+The planner here is a small custom class so the feedback loop is
+*visible*: on a failed verdict it parses ``suggested_revisions`` and
+re-emits ``compose_query`` with the corrected projection list. The
+coordinator caps consecutive failed verdicts at
+``Verifier.max_retries`` (§4.3) — no unbounded refine loops.
 
 Run:
 
@@ -23,7 +25,9 @@ Run:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -31,8 +35,10 @@ from harness import (
     Budget,
     Coordinator,
     FinishAction,
+    Plan,
+    PlanRequest,
+    Planner,
     Registry,
-    ScriptedPlanner,
     Tool,
     ToolAction,
     ToolFailure,
@@ -136,6 +142,133 @@ class SQLExplainVerifier(Verifier):
         )
 
 
+# -------- Custom planner: feedback-driven correction loop -------------------
+
+
+class _SQLPlanner(Planner):
+    """Compose → verify → finish. On a failed verdict, parse
+    ``suggested_revisions`` for the columns the verifier reports missing
+    and rewrite the projection list. Concedes after two failed verdicts
+    in a row, matching ``SQLExplainVerifier.max_retries``.
+    """
+
+    _DROP_RE = re.compile(r"^Drop columns (\[[^\]]+\])")
+
+    def __init__(self, intent_table: str, intent_projections: list[str],
+                 intent_where: dict[str, Any]) -> None:
+        self._table = intent_table
+        # Start from the planner's interpretation of the intent. In real
+        # life this is an LLM guess; here we pass in a deliberately-wrong
+        # column ('amount') so the verifier has something to correct.
+        self._projections = list(intent_projections)
+        self._where = dict(intent_where)
+        self._last_sql: str | None = None
+        self._last_compose: dict[str, Any] | None = None
+        self._phase = "compose"
+
+    def plan(self, request: PlanRequest) -> Plan:
+        obs = request.last_observation or {}
+
+        if self._phase == "compose":
+            # Compose first; verify on the next turn.
+            self._phase = "await_compose"
+            return Plan(
+                next_action=ToolAction(
+                    tool="compose_query",
+                    arguments={
+                        "table": self._table,
+                        "projections": list(self._projections),
+                        "where": dict(self._where),
+                    },
+                    rationale="translate query intent into typed SQL",
+                )
+            )
+
+        if self._phase == "await_compose":
+            out = obs.get("output") or {}
+            if not out:
+                # Tool failed — bail with the structured error.
+                return Plan(
+                    terminate=True,
+                    next_action=FinishAction(
+                        result={"error": obs.get("error", "compose_query failed")}
+                    ),
+                )
+            self._last_sql = out["sql"]
+            self._last_compose = out
+            self._phase = "await_verify"
+            return Plan(
+                next_action=VerifyAction(
+                    verifier="sql_explain",
+                    target=out,
+                    rationale="dry-run before shipping",
+                )
+            )
+
+        # self._phase == "await_verify"
+        verdict = (obs.get("verdict") or {}) if obs else {}
+        if verdict.get("passed"):
+            return Plan(
+                terminate=True,
+                next_action=FinishAction(result={"sql": self._last_sql}),
+            )
+
+        # Failed verdict — apply the verifier's suggested fix.
+        revisions = verdict.get("suggested_revisions") or []
+        corrected = self._apply_revisions(self._projections, revisions)
+        if corrected == self._projections:
+            # No actionable correction; concede.
+            return Plan(
+                terminate=True,
+                next_action=FinishAction(
+                    result={"error": "no actionable revision",
+                            "evidence": verdict.get("evidence", [])}
+                ),
+            )
+        self._projections = corrected
+        self._phase = "compose"
+        return self.plan(request)  # re-enter immediately with the new state
+
+    @staticmethod
+    def _apply_revisions(projections: list[str], revisions: list[str]) -> list[str]:
+        """Best-effort: read 'Drop columns [...]; available: [...]'.
+
+        Drops every column named in the first bracketed list, and for
+        every dropped column, picks the first column from the 'available'
+        list that doesn't already appear in projections.
+        """
+        if not revisions:
+            return projections
+        msg = revisions[0]
+        m_drop = _SQLPlanner._DROP_RE.match(msg)
+        m_avail = re.search(r"available: (\[[^\]]+\])", msg)
+        if not m_drop or not m_avail:
+            return projections
+        # The evidence uses Python-list repr (single quotes); ast.literal_eval handles it.
+        import ast
+        try:
+            drop: list[str] = ast.literal_eval(m_drop.group(1))
+            available: list[str] = ast.literal_eval(m_avail.group(1))
+        except (SyntaxError, ValueError):
+            return projections
+        out = [c for c in projections if c not in drop]
+        for d in drop:
+            for cand in available:
+                if cand not in out and cand != "id":  # 'id' is usually already there
+                    # Heuristic: pick the column whose name shares a substring
+                    # with the dropped one. Falls back to the first new one.
+                    if d in cand or cand.startswith(d):
+                        out.append(cand)
+                        break
+            else:
+                # nothing fancy matched; add the first available not already present
+                for cand in available:
+                    if cand not in out:
+                        out.append(cand)
+                        break
+        return out
+
+
 # -------- Drive --------------------------------------------------------------
 
 
@@ -144,54 +277,18 @@ def main() -> None:
     registry.register_tool(ComposeQueryTool())
     registry.register_verifier(SQLExplainVerifier())
 
-    # First branch: a bad query (projects a column that doesn't exist).
-    # The verifier reports grounded evidence pointing at the schema, and
-    # the planner re-emits with corrected projections.
-    actions = [
-        ToolAction(
-            tool="compose_query",
-            arguments={
-                "table": "orders",
-                "projections": ["id", "amount"],  # 'amount' is wrong
-                "where": {"user_id": 7},
-            },
-            rationale="first attempt",
-        ),
-        VerifyAction(
-            verifier="sql_explain",
-            target={
-                "sql": "SELECT id, amount FROM orders WHERE user_id = 7",
-                "table": "orders",
-                "projections": ["id", "amount"],
-            },
-            rationale="dry-run before shipping",
-        ),
-        # Verifier failed; planner corrects and retries.
-        ToolAction(
-            tool="compose_query",
-            arguments={
-                "table": "orders",
-                "projections": ["id", "amount_cents"],  # corrected
-                "where": {"user_id": 7},
-            },
-            rationale="retry with verifier-suggested column",
-        ),
-        VerifyAction(
-            verifier="sql_explain",
-            target={
-                "sql": "SELECT id, amount_cents FROM orders WHERE user_id = 7",
-                "table": "orders",
-                "projections": ["id", "amount_cents"],
-            },
-            rationale="re-verify",
-        ),
-        FinishAction(
-            result={"sql": "SELECT id, amount_cents FROM orders WHERE user_id = 7"}
-        ),
-    ]
+    planner = _SQLPlanner(
+        intent_table="orders",
+        # Deliberately-wrong projection: 'amount' isn't in the schema, so
+        # the first verdict fails and the planner has to apply the
+        # verifier's suggestion. The replay-friendly path is exactly the
+        # feedback loop the pattern exists to teach.
+        intent_projections=["id", "amount"],
+        intent_where={"user_id": 7},
+    )
 
     coord = Coordinator(
-        planner=ScriptedPlanner(actions=actions),
+        planner=planner,
         registry=registry,
         budget=Budget(max_iterations=15, max_tokens=20_000, max_wall_seconds=10),
         session_dir=Path(".sessions/sql"),
@@ -200,7 +297,7 @@ def main() -> None:
     result = coord.run("Get the order amounts for user 7.")
     print(json.dumps(result.model_dump(), indent=2, default=str))
 
-    # Show the two grounded verdicts so the pattern's value is visible.
+    # Show the verdict trail so the feedback loop is visible.
     from harness.types import ActionType
 
     print("\nVerifier verdicts (in order):")

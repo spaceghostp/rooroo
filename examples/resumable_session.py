@@ -178,9 +178,10 @@ def main() -> None:
     assert res1.incomplete, "expected run 1 to exhaust iterations"
 
     # --- Run 2: resume against the same session_dir. ------------------
-    # The planner reads QUEUE_KEY from FileSystemState; the trace is a
-    # fresh file (we truncate on each run by design — replay is what
-    # historical traces are for) but state IS the continuity.
+    # The planner reads QUEUE_KEY from FileSystemState; the trace is
+    # append-only across runs (§8) so Run 2's coordinator opens the
+    # existing JSONL and continues from it. Both state and trace carry
+    # the resumption.
     coord2 = _build_coordinator(SESSION_DIR, iter_budget=50)
     print(f"Run 2: resumed queue size = {len(coord2.state.get(QUEUE_KEY) or [])}")
     res2 = coord2.run("Process the queue (run 2 — resumption).")

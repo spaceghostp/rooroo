@@ -115,8 +115,13 @@ These are invariants. Implementations that violate these are not conformant. Eac
 
 - JSON-schema input and output
 - Independent context (no leakage from parent)
-- Tool allowlist (subset of harness tools)
-- Own budget (tokens, iterations, wall-clock)
+- Tool allowlist (subset of harness tools) — enforced by constructing the
+  inner Registry via ``SubAgent.build_inner_registry(parent_registry)``;
+  an allowlist entry not present in the parent raises
+  ``AllowlistViolation`` at construction time, not at runtime
+- Own budget (tokens, iterations, wall-clock) — carved from the parent's
+  remaining headroom via ``SubAgent.carve_budget(parent_budget, ...)``
+  so token / wall-time consumption propagates back to the parent (P6)
 - Cannot invoke other sub-agents unless explicitly justified per P3
 - Returns either a typed result or a typed failure — never raw conversation
 
@@ -137,7 +142,13 @@ These are invariants. Implementations that violate these are not conformant. Eac
 
 **Anti-pattern (rejected):** "Critic agent reads generator output and says if it's good." This is not a verifier under this spec.
 
-**Retry policy:** Verifier failures trigger at most N retries (default N=2), then escalate to coordinator. No unbounded refine loops.
+**Retry policy:** A given verifier may produce at most ``max_retries``
+failed verdicts in a single session (default N=2). The coordinator
+counts failed verdicts per verifier name and, on the ``(N+1)``-th
+failure, terminates the loop with
+``incomplete_reason="retry_budget_exhausted:<verifier>"``. Planners
+cannot work around this — the cap is enforced inside the coordinator's
+dispatch path, not inside the planner. No unbounded refine loops.
 
 ---
 
@@ -177,7 +188,7 @@ return synthesize(state, trace)
 **Two layers:**
 
 1. **Working state** — typed, mutable, scoped to the session. Lives in a structured store (filesystem with JSON files, or KV store). Accessed via typed read/write primitives. Diff-able.
-2. **Trace log** — append-only, structured, immutable. One entry per coordinator decision and primitive invocation. Includes inputs, outputs, timing, cost.
+2. **Trace log** — append-only, structured, immutable. One entry per coordinator decision and primitive invocation. Includes inputs, outputs, timing, cost. Append-only also *across runs sharing the same ``session_dir``*: a resumed session opens the existing JSONL file and continues appending to it, so the historical record survives resumption (P6 / §7's first-class ``incomplete=True`` outcome). To start fresh, the caller deletes the session directory.
 
 **Forbidden:**
 

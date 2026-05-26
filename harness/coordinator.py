@@ -29,8 +29,10 @@ from typing import Any
 
 from .budget import Budget
 from .errors import (
+    AllowlistViolation,
     BudgetExhausted,
     DepthLimitExceeded,
+    RetryBudgetExhausted,
     SchemaContractError,
     UnknownPrimitive,
 )
@@ -60,7 +62,9 @@ class Registry:
 
     A sub-agent's coordinator gets its own ``Registry`` filtered by the
     sub-agent's ``tool_allowlist`` so the tool surface really is a
-    subset (§4.2).
+    subset (§4.2). Use ``Registry.subset(names)`` (or
+    ``SubAgent.build_inner_registry(parent)``) to construct the filtered
+    view — that's the canonical way to honor the allowlist.
     """
 
     tools: dict[str, Tool] = field(default_factory=dict)
@@ -88,6 +92,25 @@ class Registry:
             "subagents": [s.manifest() for s in self.subagents.values()],
             "verifiers": [v.manifest() for v in self.verifiers.values()],
         }
+
+    def subset(self, tool_names: "tuple[str, ...] | list[str]") -> "Registry":
+        """Return a new Registry holding only the named tools.
+
+        Sub-agents and verifiers are NOT carried across: each sub-agent
+        builds its own inner sub-agent/verifier set as part of declaring
+        its loop. The tool surface is the only thing P-2 lets a sub-agent
+        inherit from its parent.
+
+        Raises ``AllowlistViolation`` if any name is not present in this
+        registry — that's a typo or a stale allowlist, and we'd rather
+        catch it at coordinator construction than silently drop a tool.
+        """
+        missing = [n for n in tool_names if n not in self.tools]
+        if missing:
+            raise AllowlistViolation(
+                f"tool_allowlist references tools not in parent registry: {missing}"
+            )
+        return Registry(tools={n: self.tools[n] for n in tool_names})
 
 
 class Coordinator:
@@ -124,6 +147,11 @@ class Coordinator:
             self.state = InMemoryState()
             self.trace = Trace()
             self._session_path = None
+
+        # §4.3: cap each verifier at its ``max_retries`` failed verdicts in
+        # a single session. After that, the loop terminates with
+        # ``incomplete=True`` instead of looping forever on a stuck verdict.
+        self._verifier_failures: dict[str, int] = {}
 
     # ---- main loop ------------------------------------------------------
 
@@ -187,6 +215,16 @@ class Coordinator:
                 action_output={"reason": incomplete_reason},
                 cost=Cost(),
                 outcome=Outcome.BUDGET,
+            )
+        except RetryBudgetExhausted as e:
+            incomplete = True
+            incomplete_reason = f"retry_budget_exhausted:{e.args[0] if e.args else 'unknown'}"
+            self.trace.append(
+                action_type=ActionType.FINISH,
+                action_input={},
+                action_output={"reason": incomplete_reason},
+                cost=Cost(),
+                outcome=Outcome.ERROR,
             )
         except DepthLimitExceeded as e:
             # P3 is a hard refusal. We do NOT swallow it — it should be
@@ -252,7 +290,14 @@ class Coordinator:
         # the depth-0 coordinator). A sub-agent's *own* coordinator would
         # invoke at depth=2.
         invocation_depth = self.depth + 1
-        result: SubAgentInvocation = sub.run(action.task, depth=invocation_depth)
+        # Pass the parent's registry + budget so the sub-agent can build a
+        # filtered inner registry (§4.2) and carve a sub-budget (§7).
+        result: SubAgentInvocation = sub.run(
+            action.task,
+            depth=invocation_depth,
+            parent_registry=self.registry,
+            parent_budget=self.budget,
+        )
         self.trace.append(
             action_type=ActionType.SUBAGENT,
             action_input={
@@ -283,6 +328,13 @@ class Coordinator:
             cost=result.cost,
             outcome=result.outcome,
         )
+        # §4.3: count failed verdicts (including grounding-demoted ones)
+        # per verifier and halt the loop once we cross ``max_retries``.
+        if result.ok and result.verdict is not None and not result.verdict.passed:
+            count = self._verifier_failures.get(action.verifier, 0) + 1
+            self._verifier_failures[action.verifier] = count
+            if count > verifier.max_retries:
+                raise RetryBudgetExhausted(action.verifier)
         return result.model_dump()
 
     # ---- helpers --------------------------------------------------------

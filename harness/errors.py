@@ -51,3 +51,24 @@ class GroundingError(HarnessError):
     Per §4.3 / P4, a 'verifier' with no external evidence is commentary, not
     verification. We refuse to count its verdict toward retry decisions.
     """
+
+
+class RetryBudgetExhausted(HarnessError):
+    """A verifier produced more failed verdicts in this session than
+    ``Verifier.max_retries`` permits.
+
+    Per §4.3: "Verifier failures trigger at most N retries (default N=2),
+    then escalate to coordinator. No unbounded refine loops." The
+    coordinator catches this internally and converts it into an
+    ``incomplete=True`` SessionResult — it never bubbles to the caller.
+    """
+
+
+class AllowlistViolation(HarnessError):
+    """A sub-agent attempted to expose a tool outside its declared
+    ``tool_allowlist`` to its inner coordinator (§4.2).
+
+    Raised by ``SubAgent.build_inner_registry`` when an allowlist entry
+    references a tool the parent registry doesn't own, or when extra
+    tools are requested beyond the allowlist.
+    """

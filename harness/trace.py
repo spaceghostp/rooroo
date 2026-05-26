@@ -6,6 +6,11 @@ Entries are immutable once written (the public API gives you no way to
 mutate one). The on-disk format is JSONL so you can tail it during a
 session and grep it after.
 
+Append-only also across runs that share a ``session_dir``: a resumed
+session opens the existing JSONL in append mode so the historical
+record survives the resumption. Callers that want a clean slate delete
+the session directory (Pattern 6 in the playbook does this).
+
 We deliberately do not buffer: each ``append`` flushes. That makes a
 crashed session still inspectable.
 """
@@ -71,8 +76,15 @@ class Trace:
         self._path: Path | None = Path(path) if path else None
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            # Truncate on session start. Resumption is a v2 concern.
-            self._path.write_text("")
+            # Append-only across runs sharing the same session_dir. Pre-load
+            # any prior entries into the in-memory list so cost rollups and
+            # ``by_type`` queries see the full history, then keep appending.
+            if self._path.exists():
+                for line in self._path.read_text().splitlines():
+                    if line.strip():
+                        self._entries.append(TraceEntry.from_dict(json.loads(line)))
+            else:
+                self._path.touch()
 
     @property
     def path(self) -> str | None:

@@ -121,10 +121,13 @@ class SQLDryRunVerifier(Verifier):
         )
 ```
 
-**Coordinator loop is responsible for the retry:** the verifier returns
-a verdict; the *planner* sees the verdict on the next iteration and
-either re-emits a fixed `ToolAction` or finishes. Cap retries at
-`Verifier.max_retries`. No unbounded refine loops (§4.3).
+**Planner observes, coordinator caps:** the verifier returns a verdict;
+the *planner* sees the verdict on the next iteration and either re-emits
+a fixed `ToolAction` or finishes. The cap at `Verifier.max_retries`
+lives in the coordinator, not the planner: after `max_retries` failed
+verdicts for a given verifier name, the loop terminates with
+`incomplete_reason="retry_budget_exhausted:<verifier>"` regardless of
+what the planner emits next. No unbounded refine loops (§4.3).
 
 **Runnable example:** `examples/sql_session.py` — `compose_query` tool
 plus a `sql_explain` verifier that touches schema + row-count evidence
@@ -163,6 +166,15 @@ paying compounding-error tax for each additional layer.
   fact-extractor vs. a confident planner)
 - The work needs a *restricted tool subset* you don't want the parent
   to use freely
+
+**Wiring the inner coordinator:** inside ``_run``, build the inner
+Registry via ``self.build_inner_registry(scratch["parent_registry"])``
+(the harness raises ``AllowlistViolation`` if your ``tool_allowlist``
+references a tool the parent doesn't have), and the inner Budget via
+``self.carve_budget(scratch["parent_budget"])`` so token + wall-time
+consumption flows back to the parent. Pass ``depth=scratch["depth"]``
+into the inner Coordinator so depth-2 invocations land at depth 2 and
+the harness can enforce P3.
 
 **Skeleton:**
 
@@ -330,7 +342,9 @@ budget exhaustion is a first-class outcome (§7) not an error.
 **Configuration:**
 
 - `FileSystemState` rooted at a stable `session_dir`
-- Trace at `session_dir/trace.jsonl`
+- Trace at `session_dir/trace.jsonl` — append-only across runs sharing
+  the same `session_dir` (§8). Resumed runs load prior entries into
+  memory and keep appending; to start fresh, delete the directory.
 - Coordinator carries a generous wall-clock cap but a *modest* iteration
   cap, so each run terminates cleanly on `incomplete=True` and the
   caller can re-launch with the same `session_dir`
@@ -394,12 +408,19 @@ those costs compound.
 - [ ] Every verifier declares ≥1 `evidence_sources` and actually consults
       external evidence (P4)
 - [ ] Every sub-agent has a `tool_allowlist` that is a *real subset* of
-      the parent's tools (§4.2)
-- [ ] Budget caps are set on the parent and carved (or default-set) for
-      every sub-agent (P6, §7)
+      the parent's tools, and its `_run` builds the inner Registry via
+      `self.build_inner_registry(scratch["parent_registry"])` (§4.2)
+- [ ] Budget caps are set on the parent and carved via
+      `self.carve_budget(scratch["parent_budget"])` for every sub-agent
+      that runs an inner coordinator (P6, §7)
+- [ ] Sub-agent inner coordinators are constructed with
+      `depth=scratch["depth"]` — forgetting this silently allows
+      depth-3 chains (P3)
 - [ ] If any sub-agent runs at depth 2, it has `depth2_justification`
       documented (P3)
 - [ ] The planner does not reach for the raw trace — only `state_summary`
       and `last_observation` (§5)
 - [ ] You can articulate, in one sentence, what `incomplete=True` means
-      for this configuration and what the caller should do
+      for this configuration and what the caller should do (note: the
+      coordinator may also set `incomplete=True` with reason
+      `retry_budget_exhausted:<verifier>` per §4.3)

@@ -8,10 +8,12 @@ package implements them.
 from .budget import Budget
 from .coordinator import Coordinator, Registry
 from .errors import (
+    AllowlistViolation,
     BudgetExhausted,
     DepthLimitExceeded,
     GroundingError,
     HarnessError,
+    RetryBudgetExhausted,
     SchemaContractError,
     UnknownPrimitive,
 )
@@ -81,9 +83,11 @@ __all__ = [
     "SessionResult",
     # Errors
     "HarnessError",
+    "AllowlistViolation",
     "BudgetExhausted",
     "DepthLimitExceeded",
     "GroundingError",
+    "RetryBudgetExhausted",
     "SchemaContractError",
     "UnknownPrimitive",
 ]

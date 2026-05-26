@@ -79,3 +79,47 @@ def test_by_type_filter():
             outcome=Outcome.OK,
         )
     assert len(t.by_type(ActionType.TOOL)) == 2
+
+
+def test_trace_appends_across_sessions_on_same_path(tmp_path):
+    """§8: trace is append-only across runs sharing a session_dir.
+
+    A second ``Trace(path)`` against an existing file must load prior
+    entries (so cost rollups and ``by_type`` queries see history) and
+    keep appending — not truncate.
+    """
+    path = tmp_path / "trace.jsonl"
+
+    # First "run": write two entries.
+    t1 = Trace(path=path)
+    t1.append(
+        action_type=ActionType.TOOL,
+        action_input={"run": 1, "i": 0},
+        action_output={},
+        cost=Cost(tokens_in=1),
+        outcome=Outcome.OK,
+    )
+    t1.append(
+        action_type=ActionType.TOOL,
+        action_input={"run": 1, "i": 1},
+        action_output={},
+        cost=Cost(tokens_in=2),
+        outcome=Outcome.OK,
+    )
+
+    # Second "run": open the same path. Prior entries must be visible.
+    t2 = Trace(path=path)
+    assert len(t2) == 2
+    assert t2.entries()[0].action_input == {"run": 1, "i": 0}
+    t2.append(
+        action_type=ActionType.TOOL,
+        action_input={"run": 2, "i": 0},
+        action_output={},
+        cost=Cost(tokens_in=4),
+        outcome=Outcome.OK,
+    )
+
+    # On-disk: three entries total. Cost rollup spans both runs.
+    reloaded = Trace.load(path)
+    assert len(reloaded) == 3
+    assert t2.cost_rollup().tokens_in == 1 + 2 + 4

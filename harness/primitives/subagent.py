@@ -6,18 +6,31 @@ a typed function: structured task in, structured result out.
 
 Depth enforcement (P3): a sub-agent at depth 1 may not invoke another
 sub-agent unless ``depth2_justification`` is non-empty. No depth 3.
+
+When a sub-agent's ``_run`` constructs an inner Coordinator, it should
+build the inner Registry via ``self.build_inner_registry(parent_registry)``
+so the ``tool_allowlist`` declaration actually constrains the tool
+surface (§4.2). The parent's Budget and Registry travel into ``_run``
+through the ``scratch`` dict; the parent coordinator places them there
+before dispatching, and the sub-agent uses ``scratch["budget"].carve(...)``
+to claim a sub-budget that propagates token/wall-time consumption back
+to the parent (P6).
 """
 
 from __future__ import annotations
 
 import abc
 import time
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar, TYPE_CHECKING
 
 from pydantic import BaseModel, ValidationError
 
 from ..errors import DepthLimitExceeded, SchemaContractError
 from ..types import Cost, Outcome, StructuredError
+
+if TYPE_CHECKING:  # avoid circular import at runtime
+    from ..budget import Budget
+    from ..coordinator import Registry
 
 TaskModel = TypeVar("TaskModel", bound=BaseModel)
 ResultModel = TypeVar("ResultModel", bound=BaseModel)
@@ -95,7 +108,14 @@ class SubAgent(abc.ABC, Generic[TaskModel, ResultModel]):
 
     # ---- harness-facing entrypoint --------------------------------------
 
-    def run(self, task_arguments: dict[str, Any], depth: int = 1) -> SubAgentInvocation:
+    def run(
+        self,
+        task_arguments: dict[str, Any],
+        depth: int = 1,
+        *,
+        parent_registry: "Registry | None" = None,
+        parent_budget: "Budget | None" = None,
+    ) -> SubAgentInvocation:
         started = time.monotonic()
 
         if depth > 2:
@@ -122,7 +142,16 @@ class SubAgent(abc.ABC, Generic[TaskModel, ResultModel]):
                 outcome=Outcome.ERROR,
             )
 
-        scratch: dict[str, Any] = {}
+        # The parent stashes Registry and Budget into ``scratch`` so the
+        # sub-agent's ``_run`` can build an allowlist-filtered inner
+        # Registry and carve a sub-budget. Both keys are optional; a
+        # standalone ``SubAgent.run`` (e.g. from a test) doesn't have
+        # to supply them.
+        scratch: dict[str, Any] = {
+            "depth": depth,
+            "parent_registry": parent_registry,
+            "parent_budget": parent_budget,
+        }
         try:
             raw_result = self._run(task, scratch)
         except Exception as e:  # never bubble to parent coordinator
@@ -174,3 +203,52 @@ class SubAgent(abc.ABC, Generic[TaskModel, ResultModel]):
                 "wall_seconds": cls.default_max_wall_seconds,
             },
         }
+
+    # ---- inner-coordinator wiring helpers -------------------------------
+
+    def build_inner_registry(self, parent_registry: "Registry") -> "Registry":
+        """Return a Registry holding only the tools in this sub-agent's
+        ``tool_allowlist`` (§4.2). Inner sub-agents and verifiers are
+        *not* carried across; the sub-agent's ``_run`` registers any it
+        needs.
+
+        Use this when constructing the inner Coordinator inside ``_run``::
+
+            inner_registry = self.build_inner_registry(scratch["parent_registry"])
+            inner_registry.register_subagent(SomeChildAgent())
+            inner = Coordinator(registry=inner_registry, ..., depth=scratch["depth"])
+
+        That keeps the allowlist live: a typo or a tool not in the
+        parent's registry raises ``AllowlistViolation`` here, before the
+        inner coordinator runs.
+        """
+        return parent_registry.subset(self.tool_allowlist)
+
+    def carve_budget(
+        self,
+        parent_budget: "Budget | None",
+        *,
+        max_tokens: int | None = None,
+        max_iterations: int | None = None,
+        max_wall_seconds: float | None = None,
+    ) -> "Budget":
+        """Carve a child Budget from the parent's remaining headroom.
+
+        Falls back to the sub-agent's class-level defaults
+        (``default_max_*``) when the parent didn't pass anything in
+        (e.g. for standalone tests). When ``parent_budget`` is supplied,
+        token and wall-time consumption inside the inner coordinator
+        propagates back to it (P6, §7).
+        """
+        from ..budget import Budget  # local import to avoid cycle
+
+        toks = max_tokens if max_tokens is not None else self.default_max_tokens
+        iters = max_iterations if max_iterations is not None else self.default_max_iterations
+        wall = max_wall_seconds if max_wall_seconds is not None else self.default_max_wall_seconds
+        if parent_budget is None:
+            return Budget(max_tokens=toks, max_iterations=iters, max_wall_seconds=wall)
+        return parent_budget.carve(
+            max_tokens=toks,
+            max_iterations=iters,
+            max_wall_seconds=wall,
+        )
