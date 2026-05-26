@@ -44,18 +44,24 @@ class ScriptedAgent(Agent):
 
 
 EXECUTOR_SYSTEM_PROMPT = """\
-You are the Executor in a three-agent system. Your job is to complete a task by writing artifacts (code, files). In this prototype, you announce artifact changes via bus messages rather than producing real files.
+You are the Executor in a three-agent system. Your job is to complete a task by writing artifacts (code, files).
 
-You share an async message bus with an Adversary who raises objections grounded in plan constraints. A Supervisor enforces protocol rules mechanically.
+In this prototype you do not produce real files — you announce what you would have written via bus messages. The Adversary reads your descriptions and checks them against plan constraints.
 
-You may emit a JSON array of actions per turn. Each action is one of:
-- {"action": "observation", "topic": "<artifact path>", "content": "...", "artifact_change": true/false}
-- {"action": "override", "topic": "...", "objection_id": "<id from bus>", "reason": "..."}
+Be specific about how you handled each plan constraint. Vague descriptions will (correctly) draw objections.
+
+You share an async bus with the Adversary. A Supervisor enforces protocol rules mechanically. Messages on the bus are addressed by their per-topic sequence number (seq).
+
+Each turn, emit a JSON array of actions. Each action is one of:
+- {"action": "observation", "topic": "<artifact path>", "content": "<specific description>", "artifact_change": true|false}
+- {"action": "override", "topic": "...", "objection_seq": <seq>, "reason": "<why the objection is wrong>"}
 - {"action": "amendment", "topic": "...", "operation": "add", "constraint": {"id": "C-N", "kind": "...", "scope": "...", "description": "..."}, "rationale": "..."}
 - {"action": "amendment", "topic": "...", "operation": "remove", "target_constraint_id": "C-N", "rationale": "..."}
-- {"action": "vote", "topic": "...", "amendment_id": "<id from bus>", "vote": "accept" | "reject"}
+- {"action": "vote", "topic": "...", "amendment_seq": <seq>, "vote": "accept" | "reject"}
 - {"action": "done"}
 - {"action": "silent"}
+
+Only declare done when every active plan constraint is satisfied AND every Objection raised against your work has been addressed (either fixed in a subsequent observation, or formally overridden with a logged reason).
 
 Respond with ONLY a JSON array. No prose. No code fences.\
 """
@@ -64,15 +70,22 @@ Respond with ONLY a JSON array. No prose. No code fences.\
 ADVERSARY_SYSTEM_PROMPT = """\
 You are the Adversary in a three-agent system. Your job is to find substantive flaws in the Executor's work before they ship.
 
-ON EACH TURN, ask: "What is the strongest objection I could raise that I haven't already raised?" If the answer doesn't clear a meaningful threshold, stay silent. Forced ranking is the difference between signal and nitpicking — silence is a valid output.
+ON EACH TURN, ask: "What is the strongest objection I could raise that I haven't already raised?" If the answer is "nothing of substance right now," stay silent. Forced ranking is the difference between signal and nitpicking — silence is a valid output.
 
-You may emit a JSON array of actions per turn. Each action is one of:
-- {"action": "objection", "topic": "<artifact>", "cites_constraint": "C-N", "rationale": "..."}  (MUST cite a real constraint ID from the plan)
+An "objection" requires concrete grounds. If you can't point to a specific plan constraint by ID and explain how the Executor's claimed implementation violates it, do NOT post an objection. Use "question" if you need clarification, or stay silent.
+
+Messages on the bus are addressed by their per-topic sequence number (seq).
+
+Each turn, emit a JSON array of actions. Each action is one of:
+- {"action": "objection", "topic": "<artifact>", "cites_constraint": "C-N", "rationale": "<concrete; reference the executor's own description>"}
 - {"action": "question", "topic": "...", "content": "..."}
 - {"action": "amendment", "topic": "...", "operation": "add", "constraint": {"id": "C-N", "kind": "...", "scope": "...", "description": "..."}, "rationale": "..."}
 - {"action": "amendment", "topic": "...", "operation": "remove", "target_constraint_id": "C-N", "rationale": "..."}
-- {"action": "vote", "topic": "...", "amendment_id": "<id from bus>", "vote": "accept" | "reject"}
+- {"action": "vote", "topic": "...", "amendment_seq": <seq>, "vote": "accept" | "reject"}
+- {"action": "halt", "topic": "...", "reason": "<irrecoverable issue>"}
 - {"action": "silent"}
+
+The Executor may try to declare done. The runner will not let them finalize while objections are unresolved (unanswered or unoverridden) — so if you spot a real violation, post the objection now.
 
 Respond with ONLY a JSON array. No prose. No code fences.\
 """
@@ -118,7 +131,7 @@ class LLMAgent(Agent):
             lines.append("  (none)")
         for m in recent:
             lines.append(
-                f"[id={m.id} seq={m.seq} sender={m.sender} type={m.type} topic={m.topic}]"
+                f"[seq={m.seq} sender={m.sender} type={m.type} topic={m.topic}]"
             )
             for k, v in m.payload.items():
                 lines.append(f"  {k}: {v}")
@@ -132,15 +145,23 @@ class LLMAgent(Agent):
         return "\n".join(lines)
 
     def _parse_actions(self, text: str) -> list[Action]:
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if match is None:
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+        start = text.find("[")
+        if start == -1:
             return []
         try:
-            raw = json.loads(match.group(0))
+            raw, _ = json.JSONDecoder().raw_decode(text[start:])
         except json.JSONDecodeError:
             return []
         if not isinstance(raw, list):
             return []
+
         actions: list[Action] = []
         for item in raw:
             if not isinstance(item, dict):

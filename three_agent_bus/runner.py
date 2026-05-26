@@ -68,6 +68,8 @@ class Runner:
         self.supervisor.apply_ratified_amendments()
         findings = self.supervisor.scan()
 
+        if self.bus.by_type("halt"):
+            return "halt"
         for f in findings:
             if f.kind == "budget_exceeded":
                 return "budget"
@@ -91,11 +93,25 @@ class Runner:
             findings=self.supervisor.scan(),
         )
 
+    def _resolve_ref_to_id(
+        self, topic: str, type: str, payload: dict, id_key: str, seq_key: str
+    ) -> Optional[str]:
+        ref_id = payload.get(id_key)
+        if isinstance(ref_id, str) and ref_id:
+            return ref_id
+        ref_seq = payload.get(seq_key)
+        if isinstance(ref_seq, int):
+            for m in self.bus.for_topic(topic):
+                if m.type == type and m.seq == ref_seq:
+                    return m.id
+        return None
+
     def _post(self, sender: str, action: Action) -> None:
         a = action
         if a.type == "silent":
             return
         topic = a.payload.get("topic", "")
+
         if a.type == "observation":
             self.bus.post(
                 topic=topic,
@@ -107,12 +123,17 @@ class Runner:
                 },
             )
         elif a.type == "override":
+            obj_id = self._resolve_ref_to_id(
+                topic, "objection", a.payload, "objection_id", "objection_seq"
+            )
+            if obj_id is None:
+                return
             self.bus.post(
                 topic=topic,
                 sender=sender,
                 type="override",
                 payload={
-                    "objection_id": a.payload.get("objection_id", ""),
+                    "objection_id": obj_id,
                     "reason": a.payload.get("reason", ""),
                 },
             )
@@ -133,6 +154,13 @@ class Runner:
                 type="question",
                 payload={"content": a.payload.get("content", "")},
             )
+        elif a.type == "halt":
+            self.bus.post(
+                topic=topic,
+                sender=sender,
+                type="halt",
+                payload={"reason": a.payload.get("reason", "")},
+            )
         elif a.type == "amendment":
             payload = {
                 "operation": a.payload.get("operation", ""),
@@ -144,12 +172,17 @@ class Runner:
                 payload["target_constraint_id"] = a.payload["target_constraint_id"]
             self.bus.post(topic=topic, sender=sender, type="amendment", payload=payload)
         elif a.type == "vote":
+            amend_id = self._resolve_ref_to_id(
+                topic, "amendment", a.payload, "amendment_id", "amendment_seq"
+            )
+            if amend_id is None:
+                return
             self.bus.post(
                 topic=topic,
                 sender=sender,
                 type="vote",
                 payload={
-                    "amendment_id": a.payload.get("amendment_id", ""),
+                    "amendment_id": amend_id,
                     "vote": a.payload.get("vote", ""),
                 },
             )
